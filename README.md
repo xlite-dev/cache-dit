@@ -21,13 +21,15 @@
 Cache-DiT is compatible with compilation, CPU Offloading, and quantization, fully integrates with [SGLang Diffusion](https://docs.sglang.io/diffusion/performance/cache/cache_dit.html), [vLLM-Omni](https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_acceleration/cache_dit/), ComfyUI, and runs natively on NVIDIA GPUs, Ascend NPUs and AMD GPUs. Cache-DiT is **fast**, **easy to use**, and **flexible** for various DiTs (online docs at 📘[readthedocs.io](https://cache-dit.readthedocs.io/en/latest/)).
 
 <div align="center">
-  <img src=https://github.com/vipshop/cache-dit/raw/main/assets/speedup_v5.png width=800px>
   <p align="center">
-    <i>(Let's go beyond Cache-DiT) 👉</i> <a href="https://docs.sglang.io/diffusion/performance/cache/cache_dit.html"> SGLang Diffusion </a> | <a href="https://docs.vllm.ai/projects/vllm-omni/en/latest/user_guide/diffusion/cache_acceleration/cache_dit/"> vLLM-Omni </a> | <a href="https://huggingface.co/docs/diffusers/main/en/optimization/cache_dit"> Diffusers </a>
+    <i>⚡️9x speedup by Cache-DiT with Cache, Context Parallelism and Compilation</i>
   </p>
+  <img src=https://github.com/vipshop/cache-dit/raw/main/assets/speedup_v5.png width=800px>
 </div>
 
-## 🚀Quick Start: Cache, Parallelism, Quantization
+<div align="center">
+  <p> <h2>🚀Quick Start: Cache, Parallelism and Quantization</h2> </p>
+</div>
 
 First, you can install the cache-dit from PyPI or install from source: 
 
@@ -56,7 +58,9 @@ Then, try to accelerate your DiTs with just **♥️one line♥️** of code ~
 
 For more advanced features, please refer to our online documentation at 📘[Documentation](https://cache-dit.readthedocs.io/en/latest/user_guide/OVERVIEWS/).
 
-## 🚀Quick Start: SVDQuant (W4A4) PTQ workflow
+<div align="center">
+  <p> <h2>🚀Quick Start: SVDQuant (W4A4) PTQ workflow</h2> </p>
+</div>
 
 First, build Cache-DiT from source with SVDQuant support (Experimental):
 
