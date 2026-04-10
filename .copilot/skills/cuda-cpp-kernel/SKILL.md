@@ -100,8 +100,8 @@ Use the bundled architecture guides as the first reference for cross-architectur
 
 1. For `sm89`, focus on memory throughput, L2 hit rate, kernel fusion opportunity, and the lack of TMA or cluster features.
 2. For `sm90`, focus on TMA overlap, warpgroup behavior, shared-memory staging, and whether the timeline shows good load or compute overlap.
-3. For `sm100` and `sm103`, focus on WGMMA or tcgen05 usage, TMEM behavior, TMA v2 overlap, cluster behavior, and whether the kernel actually benefits from Blackwell datacenter features.
-4. For `sm120`, treat it closer to Ada than to datacenter Blackwell for profiling purposes: watch memory throughput, L2 hit rate, shared-memory limits, and the absence of TMA, TMEM, or cluster features.
+3. For `sm100` and `sm103`, focus on `tcgen05` usage, TMEM behavior, TMA v2 overlap, cluster behavior, and whether the kernel actually benefits from Blackwell datacenter features.
+4. For `sm120`, treat it closer to Ada than to datacenter Blackwell for profiling purposes: watch memory throughput, L2 hit rate, shared-memory limits, and the lack of TMEM or cluster features while deciding explicitly whether TMA or `cp.async` is the better staging path.
 
 Recommended order:
 
@@ -126,9 +126,10 @@ If the task is a migration into cache-dit, keep the kernel work separate from re
 
 1. Reproduce the issue with the smallest input that still fails.
 2. Confirm the failure mode: wrong value, launch error, illegal memory access, race, hang, or performance regression.
-3. Use compute-sanitizer or cuda-gdb for correctness problems.
-4. Use Nsight Systems first for end-to-end bottlenecks, then Nsight Compute for per-kernel root cause.
-5. After each change, rerun the focused correctness test before doing broader benchmarks.
+3. When the kernel uses shared memory, `cp.async`, or any other asynchronous staging path, treat data-synchronization bugs as a first-line hypothesis. If only some shapes or stage-count cases fail, suspect missing barriers, premature shared-memory slot reuse, or incomplete predicate protection before assuming the math is wrong.
+4. Use compute-sanitizer or cuda-gdb for correctness problems.
+5. Use Nsight Systems first for end-to-end bottlenecks, then Nsight Compute for per-kernel root cause.
+6. After each change, rerun the focused correctness test before doing broader benchmarks.
 
 ## Performance Workflow
 
