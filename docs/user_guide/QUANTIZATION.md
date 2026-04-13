@@ -16,8 +16,8 @@ Quantization is a powerful technique to reduce the memory footprint and computat
 |<span style="color:#c77dff;">int8_per_tensor</span>|quantize weights and activations to int8 (<span style="color:green;">dynamic quantization</span>) with tensorwise method.|<span style="color:#c77dff;">>=sm80</span>, Ampere or newer|
 |<span style="color:#c77dff;">int8_weight_only</span>|quantize <span style="color:green;">only weights</span> to int8, keep activations in full precision|<span style="color:#c77dff;">>=sm80</span>, Ampere or newer|
 |<span style="color:#c77dff;">int4_weight_only</span>|quantize <span style="color:green;">only weights</span> to int4, keep activations in full precision|<span style="color:#c77dff;">>=sm90</span>, Hopper or newer, TMA required|
-|<span style="color:#c77dff;">svdq_int4_r{rank}_dq</span>|quantize weights and activations to int4 with <span style="color:green;">SVDQuant dynamic quantization (W4A4)</span>. The current zero-calibration DQ contract fixes the smooth factor to 1 and runs fully in memory; user-facing generate examples and shortcut flags currently focus on <span style="color:#c77dff;">r32</span> and <span style="color:#c77dff;">r128</span>.|<span style="color:#c77dff;">>=sm80</span>, Ampere or newer, excluded Hopper (NO INT4 MMA)|
-|<span style="color:#c77dff;">svdq_int4_r{32...}</span>|post-training SVDQuant (W4A4) with calibration and checkpoint serialization for users who want the higher-accuracy PTQ workflow.|<span style="color:#c77dff;">>=sm80</span>, Ampere or newer, excluded Hopper (NO INT4 MMA)|
+|<span style="color:#c77dff;">svdq_int4_r{32...}</span>|post-training <span style="color:green;">SVDQuant (W4A4)</span> with calibration and checkpoint serialization for users who want the higher-accuracy PTQ workflow.|<span style="color:#c77dff;">>=sm80</span>, Ampere or newer, excluded Hopper (NO INT4 MMA)|
+|<span style="color:#c77dff;">svdq_int4_r{32...}_dq</span>|quantize weights and activations to int4 with <span style="color:green;">SVDQuant dynamic quantization (W4A4)</span> without any calibration.|<span style="color:#c77dff;">>=sm80</span>, Ampere or newer, excluded Hopper (NO INT4 MMA)|
 
 
 ## FP8 Quantization
@@ -509,20 +509,30 @@ The same workflow is available from the generate CLI through <span style="color:
 ```bash
 # default: identity smooth strategy
 python -m cache_dit.generate flux2_klein_4b --quantize-type svdq_int4_r128_dq \
-  --svdq-smooth-strategy identity
+  --svdq-smooth-strategy identity --svdq-calibrate-precision low
 
 # experimental: weight-only heuristic
 python -m cache_dit.generate flux2_klein_4b --quantize-type svdq_int4_r128_dq \
-  --svdq-smooth-strategy weight
+  --svdq-smooth-strategy weight --svdq-calibrate-precision low
 
 # experimental: bias the trade-off toward easier activation quantization
 python -m cache_dit.generate flux2_klein_4b --quantize-type svdq_int4_r128_dq \
-  --svdq-smooth-strategy weight_inv
+  --svdq-smooth-strategy weight_inv --svdq-calibrate-precision low
+
+# high-rank are recommended for better precision while using SVDQ DQ, e.g, 256.
+python -m cache_dit.generate flux2_klein_4b --quantize-type svdq_int4_r256_dq \
+  --svdq-smooth-strategy identity --svdq-calibrate-precision low
+
+# higher SVD decomposition precision may be helpful for better DQ accuracy.
+python -m cache_dit.generate flux2_klein_4b --quantize-type svdq_int4_r256_dq \
+  --svdq-smooth-strategy identity --svdq-calibrate-precision medium
 ```
 
 Unlike the PTQ workflow, SVDQ dynamic quantization is <span style="color:green;">in-memory only</span>. It does not require <span style="color:#c77dff;">calibrate_fn</span> or <span style="color:#c77dff;">serialize_to</span>, and it does not support <span style="color:#c77dff;">load()</span> from a serialized checkpoint.
 
 At the backend-config level, this means DQ currently supports <span style="color:#c77dff;">identity</span> by default and experimental <span style="color:#c77dff;">weight</span> / <span style="color:#c77dff;">weight_inv</span> heuristics as explicit opt-ins. In the CLI, this is controlled by <span style="color:#c77dff;">--svdq-smooth-strategy</span>, whose default value is <span style="color:#c77dff;">identity</span>. PTQ keeps the activation-derived strategy and serialized checkpoint workflow. We will support more smooth strategies in the future, and this separation makes it easier to add those as opt-in extensions without redefining the meaning of existing `_dq` quant types.
+
+The CLI also exposes <span style="color:#c77dff;">--svdq-calibrate-precision</span> (alias <span style="color:#c77dff;">--svdq-calib</span>) for the SVDQ decomposition math. For DQ, the default remains <span style="color:#c77dff;">low</span> to preserve the shipped fast path, but users can now explicitly select <span style="color:#c77dff;">medium</span> or <span style="color:#c77dff;">high</span> when they want a different accuracy / quantization-time trade-off. The SVDQ runtime path keeps the default kernel behavior unless users explicitly opt into other backend-local settings.
 
 Here are some preliminary results on the impact of different DQ smooth strategies for a SVDQ DQ sweep on FLUX.2-klein-4B. 
 
@@ -531,3 +541,23 @@ Here are some preliminary results on the impact of different DQ smooth strategie
 | 2.13s | 1.28s | 1.28s | 1.28s |
 |-| PSNR: 28.71 | PSNR: 29.62 | PSNR: 29.35 |
 |![](../assets/flux2_klein_4b.1024x1024.C0.png)|![](../assets/flux2_klein_4b.1024x1024.C0_svdq_int4_r128_dq.png)|![](../assets/flux2_klein_4b.1024x1024.C0_svdq_int4_r128_dq_weight.png)|![](../assets/flux2_klein_4b.1024x1024.C0_svdq_int4_r128_dq_weight_inv.png)|
+
+## SVDQuant (W4A4) Runtime
+
+Cache-DiT's SVDQuant support also includes a high-performance W4A4 GEMM kernel for efficient runtime execution of SVDQ-quantized models. This kernel is optimized for Ada and Ampere architectures and can provide slightly better performance compared to existing INT4 GEMM kernels.
+
+Users can enable the SVDQuant runtime by setting the <span style="color:green;">runtime_kernel</span> argument in <span style="color:#c77dff;">QuantizeConfig</span> to <span style="color:green;">v2</span>. For example:
+
+```python
+quant_config = QuantizeConfig(
+  quant_type="svdq_int4_r128_dq", # _r{rank}, e.g., r16, r32, r64, r128, etc.
+  svdq_kwargs={"runtime_kernel": "v2"},  # enable SVDQ W4A4 v2 GEMM kernel for better performance.
+)
+```
+Quick examples for enabling SVDQ runtime kernel from the generate CLI:
+
+```bash
+# v1 baseline: 11.81s -> v2 runtime: 11.58s 
+python3 -m cache_dit.generate flux --svdq-int4-r64-dq --compile # v1, baseline
+python3 -m cache_dit.generate flux --svdq-int4-r64-dq --svdq-runtime v2 --compile # v2
+```
