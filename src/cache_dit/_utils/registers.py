@@ -148,12 +148,19 @@ class ExampleInputData:
     input_data.pop("gen_device", None)
     return input_data
 
-  def new_generator(self, args: argparse.Namespace = None) -> torch.Generator:
+  def new_generator(
+    self,
+    args: argparse.Namespace = None,
+    *,
+    seed_override: Optional[int] = None,
+  ) -> torch.Generator:
     # NOTE: We should always create a new generator before each inference to
     # ensure reproducibility when using the same seed. Alawys use cpu generator
     # for better cross-device consistency.
     if args is not None and args.generator_device is not None:
       self.gen_device = args.generator_device
+    if seed_override is not None:
+      return torch.Generator(self.gen_device).manual_seed(seed_override)
     if args is not None and args.seed is not None:
       return torch.Generator(self.gen_device).manual_seed(args.seed)
     elif self.seed is not None:
@@ -411,6 +418,8 @@ class ExampleInitConfig:
       summary_str += f"{model_name_or_path}\n"
     summary_str += f"- Task Type: {self.task_type.value}\n"
     summary_str += f"- Torch Dtype: {self.torch_dtype}\n"
+    summary_str += f"- Warmup Seed: {getattr(args, 'warmup_seed', None)}\n"
+    summary_str += f"- Warmup Prompt: {getattr(args, 'warmup_prompt', None)}\n"
     if self.lora_weights_path is not None and self.lora_weights_name is not None:
       summary_str += (
         f"- LoRA Weights: {os.path.join(self.lora_weights_path, self.lora_weights_name)}\n")
@@ -526,7 +535,6 @@ class Example:
     load_time = time.time() - start_time
 
     input_kwargs, extra_optimize_kwargs = self.prepare_input_data()
-    default_num_inference_steps = input_kwargs.get("num_inference_steps", None)
 
     maybe_apply_optimization(self.args, pipe, **extra_optimize_kwargs)
 
@@ -540,20 +548,14 @@ class Example:
     # warm up
     start_time = time.time()
     for _ in range(self.args.warmup):
-      input_kwargs = self.new_generator(input_kwargs, self.args)
+      warmup_kwargs = self.new_generator(dict(input_kwargs), self.args, warmup=True)
       if self.args.warmup_num_inference_steps is not None:
-        input_kwargs["num_inference_steps"] = self.args.warmup_num_inference_steps
-      _ = pipe(**input_kwargs)
+        warmup_kwargs["num_inference_steps"] = self.args.warmup_num_inference_steps
+      _ = pipe(**warmup_kwargs)
     if self.args.warmup > 0:
       warmup_time = (time.time() - start_time) / self.args.warmup
     else:
       warmup_time = None
-    # restore num_inference_steps
-    if default_num_inference_steps is not None:
-      input_kwargs["num_inference_steps"] = default_num_inference_steps
-    else:
-      # pop None num_inference_steps from input kwargs
-      input_kwargs.pop("num_inference_steps", None)
 
     start_time = time.time()
     # actual inference
@@ -564,14 +566,14 @@ class Example:
       profiler = create_profiler_from_args(self.args, profile_name=profile_name)
       with profiler:
         for _ in range(self.args.repeat):
-          input_kwargs = self.new_generator(input_kwargs, self.args)
-          output = pipe(**input_kwargs)
+          step_kwargs = self.new_generator(dict(input_kwargs), self.args)
+          output = pipe(**step_kwargs)
       if self.rank == 0:
         logger.info(f"Profiler traces saved to: {profiler.output_dir}/{profiler.trace_path.name}")
     else:
       for _ in range(self.args.repeat):
-        input_kwargs = self.new_generator(input_kwargs, self.args)
-        output = pipe(**input_kwargs)
+        step_kwargs = self.new_generator(dict(input_kwargs), self.args)
+        output = pipe(**step_kwargs)
     if self.args.repeat > 0:
       inference_time = (time.time() - start_time) / self.args.repeat
     else:
@@ -621,11 +623,24 @@ class Example:
 
     maybe_destroy_distributed()
 
-  def new_generator(self, input_kwargs: Dict[str, Any],
-                    args: argparse.Namespace) -> torch.Generator:
+  def new_generator(
+    self,
+    input_kwargs: Dict[str, Any],
+    args: argparse.Namespace,
+    *,
+    warmup: bool = False,
+  ) -> Dict[str, Any]:
     # NOTE: We should always create a new generator before each inference to
     # ensure reproducibility when using the same seed.
-    input_kwargs["generator"] = self.input_data.new_generator(args=args)
+    warmup_seed = getattr(args, "warmup_seed", None) if warmup else None
+    input_kwargs["generator"] = self.input_data.new_generator(
+      args=args,
+      seed_override=warmup_seed,
+    )
+    if warmup:
+      warmup_prompt = getattr(args, "warmup_prompt", None)
+      if warmup_prompt is not None:
+        input_kwargs["prompt"] = warmup_prompt
     return input_kwargs
 
 
