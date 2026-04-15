@@ -19,11 +19,15 @@ from cache_dit import BlockAdapter
 from cache_dit.kernels import svdq_extension_is_available
 from cache_dit.metrics import compute_psnr
 from cache_dit._utils.utils import get_args
+from cache_dit._utils.utils import maybe_apply_optimization
 from cache_dit._utils.utils import maybe_compile_transformer
+from cache_dit._utils.utils import maybe_finalize_deferred_svdq_pipe_move
 from cache_dit._utils.utils import maybe_quantize_transformer
 from cache_dit._utils.utils import maybe_postprocess_args
+from cache_dit.offload import get_layerwise_offload_handles
 from cache_dit.quantization import QuantizeConfig
 from cache_dit.quantization.svdquant import SVDQW4A4Linear
+from tests.quantization._svdq_test_utils import TOY_ATTENTION_LINEAR_NAMES
 from tests.quantization._svdq_test_utils import ToyTransformerBlock
 from tests.quantization._svdq_test_utils import assert_rank_metric_trend
 from tests.quantization._svdq_test_utils import compute_accuracy_metrics
@@ -345,6 +349,12 @@ def test_svdq_dq_config_validation_defaults_calibrate_precision_to_low() -> None
 
   assert config.get_svdq_kwargs()["calibrate_precision"] == "low"
   assert config.get_svdq_kwargs()["runtime_kernel"] == "v1"
+  assert config.get_svdq_kwargs()["quantize_device"] == "auto"
+  assert config.get_svdq_kwargs()["offload_quantized_layers_to_cpu"] is False
+  assert config.get_svdq_kwargs()["layerwise_offload"] is False
+  assert config.get_svdq_kwargs()["async_transfer"] is False
+  assert config.get_svdq_kwargs()["transfer_buckets"] == 1
+  assert config.get_svdq_kwargs()["defer_move_to_execution_device"] is False
 
 
 @pytest.mark.parametrize("runtime_kernel", ["v2", "v3"])
@@ -394,6 +404,27 @@ def test_svdq_dq_config_validation_accepts_few_shot_smooth_strategy() -> None:
   assert config.get_svdq_kwargs()["few_shot_steps"] == 1
   assert config.get_svdq_kwargs()["few_shot_relax_strategy"] == "auto"
   assert config.get_svdq_kwargs()["few_shot_auto_compile"] is False
+
+
+def test_svdq_dq_config_validation_accepts_device_strategy_kwargs() -> None:
+  config = QuantizeConfig(
+    quant_type="svdq_int4_r32_dq",
+    svdq_kwargs={
+      "quantize_device": "cuda",
+      "offload_quantized_layers_to_cpu": True,
+      "layerwise_offload": True,
+      "async_transfer": True,
+      "transfer_buckets": 2,
+      "defer_move_to_execution_device": True,
+    },
+  )
+
+  assert config.get_svdq_kwargs()["quantize_device"] == "cuda"
+  assert config.get_svdq_kwargs()["offload_quantized_layers_to_cpu"] is True
+  assert config.get_svdq_kwargs()["layerwise_offload"] is True
+  assert config.get_svdq_kwargs()["async_transfer"] is True
+  assert config.get_svdq_kwargs()["transfer_buckets"] == 2
+  assert config.get_svdq_kwargs()["defer_move_to_execution_device"] is True
 
 
 def test_svdq_dq_config_validation_rejects_ptq_only_fields_and_load(tmp_path: Path) -> None:
@@ -451,6 +482,9 @@ def test_svdq_dq_cli_flags_map_to_quantize_type() -> None:
   assert args.svdq_smooth_strategy == "identity"
   assert args.svdq_calibrate_precision == "low"
   assert args.svdq_runtime == "v1"
+  assert args.svdq_quantize_device == "cuda"
+  assert args.svdq_offload_quantized_layers_to_cpu is False
+  assert args.svdq_defer_final_to_cuda is True
 
   args = maybe_postprocess_args(parser.parse_args(["--svdq-int4-r128-dq"]))
   assert args.quantize
@@ -486,6 +520,50 @@ def test_svdq_dq_cli_flags_map_to_quantize_type() -> None:
   assert args.svdq_few_shot_relax_factor == 1.5
   assert args.svdq_few_shot_relax_top_ratio == 0.25
   assert args.svdq_few_shot_relax_strategy == "auto"
+
+  args = maybe_postprocess_args(
+    parser.parse_args([
+      "--quantize-type",
+      "svdq_int4_r32_dq",
+      "--svdq-quantize-device",
+      "auto",
+      "--svdq-layerwise-offload",
+      "--svdq-layerwise-async-transfer",
+      "--svdq-layerwise-transfer-buckets",
+      "2",
+      "--svdq-keep-quantized-layers-on-device",
+      "--svdq-no-defer-final-to-cuda",
+    ]))
+  assert args.svdq_quantize_device == "auto"
+  assert args.svdq_layerwise_offload is True
+  assert args.svdq_layerwise_async_transfer is True
+  assert args.svdq_layerwise_transfer_buckets == 2
+  assert args.svdq_offload_quantized_layers_to_cpu is True
+  assert args.svdq_defer_final_to_cuda is False
+
+
+def test_generic_module_offload_cli_is_mutually_exclusive_with_diffusers_offload() -> None:
+  parser = get_args(parse=False)
+
+  with pytest.raises(SystemExit):
+    parser.parse_args(["--cpu-offload", "--module-layerwise-cpu-offload"])
+
+  with pytest.raises(SystemExit):
+    parser.parse_args(["--sequential-cpu-offload", "--module-layerwise-cpu-offload"])
+
+  args = maybe_postprocess_args(parser.parse_args(["--module-layerwise-cpu-offload"]))
+  assert args.module_layerwise_cpu_offload is True
+
+  args = maybe_postprocess_args(
+    parser.parse_args([
+      "--module-layerwise-cpu-offload",
+      "--layerwise-async-transfer",
+      "--layerwise-transfer-buckets",
+      "2",
+    ]))
+  assert args.module_layerwise_cpu_offload is True
+  assert args.layerwise_async_transfer is True
+  assert args.layerwise_transfer_buckets == 2
 
   args = maybe_postprocess_args(
     parser.parse_args([
@@ -616,6 +694,60 @@ def test_svdq_dq_cli_weight_inv_strategy_is_applied_during_transformer_quantizat
   _assert_weight_inv_smooth_factor(holder.transformer.block.to_out)
 
 
+def test_svdq_dq_cli_quantization_runs_from_cpu_root_and_keeps_quantized_layers_on_device_by_default(
+) -> None:
+  dtype = runtime_dtype()
+  model = make_toy_model(
+    embed_dim=128,
+    num_heads=4,
+    seed=57,
+    device="cpu",
+    dtype=dtype,
+  )
+  parser = get_args(parse=False)
+  args = maybe_postprocess_args(parser.parse_args([
+    "--quantize-type",
+    "svdq_int4_r32_dq",
+  ]))
+
+  holder = SimpleNamespace(transformer=model)
+  maybe_quantize_transformer(args, holder)
+
+  module = holder.transformer.block.to_q
+  assert isinstance(module, SVDQW4A4Linear)
+  assert module.qweight.device.type == "cuda"
+  assert holder.transformer._svdq_kwargs["quantize_device"] == "cuda"
+  assert holder.transformer._svdq_kwargs["offload_quantized_layers_to_cpu"] is False
+
+
+def test_svdq_dq_cli_layerwise_offload_forces_quantized_layers_back_to_cpu() -> None:
+  dtype = runtime_dtype()
+  model = make_toy_model(
+    embed_dim=128,
+    num_heads=4,
+    seed=58,
+    device="cpu",
+    dtype=dtype,
+  )
+  parser = get_args(parse=False)
+  args = maybe_postprocess_args(
+    parser.parse_args([
+      "--quantize-type",
+      "svdq_int4_r32_dq",
+      "--svdq-layerwise-offload",
+      "--svdq-keep-quantized-layers-on-device",
+    ]))
+
+  holder = SimpleNamespace(transformer=model)
+  maybe_quantize_transformer(args, holder)
+
+  module = holder.transformer.block.to_q
+  assert isinstance(module, SVDQW4A4Linear)
+  assert module.qweight.device.type == "cpu"
+  assert holder.transformer._svdq_kwargs["quantize_device"] == "cuda"
+  assert holder.transformer._svdq_kwargs["offload_quantized_layers_to_cpu"] is True
+
+
 @pytest.mark.parametrize("runtime_kernel", ["v2", "v3"])
 def test_svdq_dq_cli_runtime_kernel_is_applied_during_transformer_quantization(
   runtime_kernel: str, ) -> None:
@@ -634,6 +766,7 @@ def test_svdq_dq_cli_runtime_kernel_is_applied_during_transformer_quantization(
       "svdq_int4_r32_dq",
       "--svdq-runtime",
       runtime_kernel,
+      "--svdq-keep-quantized-layers-on-device",
     ]))
 
   holder = SimpleNamespace(transformer=model)
@@ -890,6 +1023,105 @@ def test_svdq_dq_few_shot_counts_root_forwards_cumulatively_across_runs() -> Non
   assert not getattr(quantized_model, "_svdq_pending_quantization", False)
   assert getattr(quantized_model, "_svdq_runtime_quantized_after_forwards", 0) == 4
   assert isinstance(quantized_model.block.to_q, SVDQW4A4Linear)
+
+
+def test_svdq_dq_few_shot_cleanup_releases_controller_buffers() -> None:
+  dtype = runtime_dtype()
+  model = make_toy_model(
+    embed_dim=128,
+    num_heads=4,
+    seed=172,
+    device="cuda",
+    dtype=dtype,
+  )
+  eval_inputs = make_token_batch(
+    batch_size=2,
+    seq_len=12,
+    width=128,
+    seed=173,
+    device="cuda",
+    dtype=dtype,
+  )
+
+  quantized_model = cache_dit.quantize(
+    model,
+    _make_dq_config(
+      rank=32,
+      svdq_kwargs={
+        "smooth_strategy": "few_shot",
+        "few_shot_steps": 1,
+      },
+    ),
+  )
+  controller = getattr(quantized_model, "_svdq_few_shot_controller")
+
+  with torch.inference_mode():
+    output = quantized_model(eval_inputs)
+
+  assert torch.isfinite(output).all()
+  assert not getattr(quantized_model, "_svdq_pending_quantization", False)
+  assert not hasattr(quantized_model, "_svdq_few_shot_controller")
+  assert controller._handles == []
+  assert controller._accumulators == {}
+  assert controller.activation_spans == {}
+
+
+def test_svdq_dq_few_shot_cpu_root_collection_uses_layerwise_cuda_offload() -> None:
+  model = make_toy_model(
+    embed_dim=128,
+    num_heads=4,
+    seed=174,
+    device="cpu",
+    dtype=torch.float32,
+  )
+  eval_inputs = make_token_batch(
+    batch_size=2,
+    seq_len=12,
+    width=128,
+    seed=175,
+    device="cpu",
+    dtype=torch.float32,
+  )
+
+  quantized_model = cache_dit.quantize(
+    model,
+    _make_dq_config(
+      rank=32,
+      svdq_kwargs={
+        "smooth_strategy": "few_shot",
+        "few_shot_steps": 1,
+        "quantize_device": "cuda",
+        "offload_quantized_layers_to_cpu": True,
+        "layerwise_offload": True,
+        "async_transfer": True,
+        "transfer_buckets": 2,
+      },
+    ),
+  )
+  pending_handles = get_layerwise_offload_handles(quantized_model)
+  assert len(pending_handles) == 1
+  assert pending_handles[0].async_transfer is True
+  assert pending_handles[0].transfer_buckets == 2
+  assert "block.norm" in pending_handles[0].module_names
+  for layer_name in TOY_ATTENTION_LINEAR_NAMES:
+    assert layer_name in pending_handles[0].module_names
+  observed_input_devices: list[str] = []
+  observed_linear = quantized_model.block.to_q
+  capture_handle = observed_linear.register_forward_pre_hook(
+    lambda _module, args: observed_input_devices.append(args[0].device.type))
+
+  try:
+    with torch.inference_mode():
+      output = quantized_model(eval_inputs)
+      torch.cuda.synchronize()
+  finally:
+    capture_handle.remove()
+
+  assert torch.isfinite(output).all()
+  assert observed_input_devices == ["cuda"]
+  assert not getattr(quantized_model, "_svdq_pending_quantization", False)
+  assert isinstance(quantized_model.block.to_q, SVDQW4A4Linear)
+  assert quantized_model.block.to_q.qweight.device.type == "cpu"
 
 
 def test_svdq_dq_few_shot_materializes_relaxed_and_original_smooth_vectors() -> None:
@@ -1164,6 +1396,215 @@ def test_svdq_dq_few_shot_deferred_compile_executes_once(
     output = holder.transformer(eval_inputs)
   assert torch.isfinite(output).all()
   assert compile_calls == ["transformer"]
+
+
+def test_svdq_dq_few_shot_layerwise_offload_defers_full_pipeline_move_until_after_forward() -> None:
+  dtype = runtime_dtype()
+  model = make_toy_model(
+    embed_dim=128,
+    num_heads=4,
+    seed=82,
+    device="cpu",
+    dtype=dtype,
+  )
+  parser = get_args(parse=False)
+  args = maybe_postprocess_args(
+    parser.parse_args([
+      "--quantize-type",
+      "svdq_int4_r32_dq",
+      "--svdq-smooth-strategy",
+      "few_shot",
+      "--svdq-few-shot-steps",
+      "1",
+      "--svdq-layerwise-offload",
+    ]))
+
+  move_calls: list[torch.device] = []
+  holder = SimpleNamespace(transformer=model)
+  holder.to = lambda device: move_calls.append(torch.device(device))
+
+  maybe_apply_optimization(args, holder)
+
+  assert getattr(holder.transformer, "_svdq_pending_quantization", False)
+  assert move_calls == []
+
+  eval_inputs = make_token_batch(
+    batch_size=2,
+    seq_len=12,
+    width=128,
+    seed=83,
+    device="cpu",
+    dtype=dtype,
+  )
+  with torch.inference_mode():
+    output = holder.transformer(eval_inputs)
+
+  assert torch.isfinite(output).all()
+  assert len(move_calls) == 0
+  assert hasattr(holder, "_svdq_move_to_device_after_forward")
+  assert hasattr(holder.transformer, "_svdq_runtime_layerwise_offload_handle")
+  runtime_handle = holder.transformer._svdq_runtime_layerwise_offload_handle
+  assert "block.norm" in runtime_handle.module_names
+  for layer_name in TOY_ATTENTION_LINEAR_NAMES:
+    assert layer_name in runtime_handle.module_names
+  assert maybe_finalize_deferred_svdq_pipe_move(holder)
+  assert len(move_calls) == 1
+  assert move_calls[0].type == "cuda"
+  assert not hasattr(holder, "_svdq_move_to_device_after_forward")
+  assert not hasattr(holder.transformer, "_svdq_runtime_layerwise_offload_handle")
+
+
+def test_svdq_dq_few_shot_falls_back_to_deferred_pipeline_move_on_failure() -> None:
+  dtype = runtime_dtype()
+  model = make_toy_model(
+    embed_dim=128,
+    num_heads=4,
+    seed=84,
+    device="cpu",
+    dtype=dtype,
+  )
+  parser = get_args(parse=False)
+  args = maybe_postprocess_args(
+    parser.parse_args([
+      "--quantize-type",
+      "svdq_int4_r32_dq",
+      "--svdq-smooth-strategy",
+      "few_shot",
+      "--svdq-few-shot-steps",
+      "1",
+      "--svdq-offload-quantized-layers-to-cpu",
+    ]))
+
+  move_calls: list[torch.device] = []
+  move_attempts = 0
+  holder = SimpleNamespace(transformer=model)
+
+  holder.to = lambda _device: None
+
+  maybe_apply_optimization(args, holder)
+
+  def _move_pipe(device: torch.device | str) -> None:
+    nonlocal move_attempts
+    move_attempts += 1
+    resolved_device = torch.device(device)
+    if move_attempts == 1:
+      raise RuntimeError("simulate immediate move failure")
+    move_calls.append(resolved_device)
+
+  holder.to = _move_pipe
+
+  eval_inputs = make_token_batch(
+    batch_size=2,
+    seq_len=12,
+    width=128,
+    seed=85,
+    device="cpu",
+    dtype=dtype,
+  )
+  with torch.inference_mode():
+    output = holder.transformer(eval_inputs)
+
+  assert torch.isfinite(output).all()
+  assert hasattr(holder, "_svdq_move_to_device_after_forward")
+  assert move_calls == []
+
+  assert maybe_finalize_deferred_svdq_pipe_move(holder)
+  assert len(move_calls) == 1
+  assert move_calls[0].type == "cuda"
+  assert not hasattr(holder, "_svdq_move_to_device_after_forward")
+
+
+def test_svdq_dq_few_shot_without_layerwise_offload_moves_pipe_to_cuda_eagerly() -> None:
+  dtype = runtime_dtype()
+  model = make_toy_model(
+    embed_dim=128,
+    num_heads=4,
+    seed=86,
+    device="cpu",
+    dtype=dtype,
+  )
+  parser = get_args(parse=False)
+  args = maybe_postprocess_args(
+    parser.parse_args([
+      "--quantize-type",
+      "svdq_int4_r32_dq",
+      "--svdq-smooth-strategy",
+      "few_shot",
+      "--svdq-few-shot-steps",
+      "1",
+    ]))
+
+  move_calls: list[torch.device] = []
+  holder = SimpleNamespace(transformer=model)
+  holder.to = lambda device: move_calls.append(torch.device(device))
+
+  maybe_apply_optimization(args, holder)
+
+  assert getattr(holder.transformer, "_svdq_pending_quantization", False)
+  assert len(move_calls) == 1
+  assert move_calls[0].type == "cuda"
+
+  eval_inputs = make_token_batch(
+    batch_size=2,
+    seq_len=12,
+    width=128,
+    seed=87,
+    device="cpu",
+    dtype=dtype,
+  )
+  with torch.inference_mode():
+    output = holder.transformer(eval_inputs)
+
+  assert torch.isfinite(output).all()
+  assert len(move_calls) == 1
+  assert not hasattr(holder, "_svdq_move_to_device_after_forward")
+
+
+def test_generic_module_offload_applies_to_non_diffusers_transformer_holder() -> None:
+  model = make_toy_model(
+    embed_dim=128,
+    num_heads=4,
+    seed=84,
+    device="cpu",
+    dtype=torch.float32,
+  )
+  parser = get_args(parse=False)
+  args = maybe_postprocess_args(
+    parser.parse_args([
+      "--module-layerwise-cpu-offload",
+      "--layerwise-async-transfer",
+      "--layerwise-transfer-buckets",
+      "2",
+    ]))
+
+  move_calls: list[torch.device] = []
+  holder = SimpleNamespace(transformer=model)
+  holder.to = lambda device: move_calls.append(torch.device(device))
+
+  maybe_apply_optimization(args, holder)
+
+  assert not hasattr(holder, "_cache_dit_generic_offload_handles")
+  handles = get_layerwise_offload_handles(holder.transformer)
+  assert len(handles) == 1
+  assert handles[0].async_transfer is True
+  assert handles[0].transfer_buckets == 2
+  assert move_calls == []
+  assert all(parameter.device.type == "cpu" for parameter in holder.transformer.parameters())
+
+  eval_inputs = make_token_batch(
+    batch_size=2,
+    seq_len=12,
+    width=128,
+    seed=85,
+    device="cpu",
+    dtype=torch.float32,
+  )
+  with torch.inference_mode():
+    output = holder.transformer(eval_inputs)
+    torch.cuda.synchronize()
+
+  assert torch.isfinite(output).all()
+  assert output.device.type == "cpu"
 
 
 def test_svdq_dq_few_shot_auto_compile_falls_back_to_module_compile() -> None:

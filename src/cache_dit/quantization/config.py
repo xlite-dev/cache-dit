@@ -11,6 +11,7 @@ logger = init_logger(__name__)
 _SVDQ_QUANT_TYPE_PATTERN = re.compile(r"^(svdq_int4)_r(\d+)(_dq)?$")
 _SVDQ_CALIBRATE_PRECISIONS = ("low", "medium", "high")
 _SVDQ_RUNTIME_KERNELS = ("v1", "v2", "v3")
+_SVDQ_QUANTIZE_DEVICES = ("auto", "cpu", "cuda")
 _SVDQ_SMOOTH_STRATEGIES = ("activation", "identity", "weight", "weight_inv", "few_shot")
 _SVDQ_FEW_SHOT_RELAX_STRATEGIES = ("fixed", "top", "auto", "stable_auto", "power", "log", "rank")
 _SVDQ_FEW_SHOT_RELAX_WARN_THRESHOLD = 3.0
@@ -32,6 +33,29 @@ _SVDQ_KWARGS_DEFAULTS: dict[str, Any] = {
   # - v2: w4q4 v2 GEMM plain path.
   # - v3: CuTe DSL rewrite path for the SVDQ runtime kernels.
   "runtime_kernel": "v1",
+  # Device used for the SVDQ decomposition and packing math.
+  # - auto: preserve the module's current execution device.
+  # - cpu: force CPU-side decomposition and packing.
+  # - cuda: force CUDA-side decomposition and packing even when the float module
+  #   is still resident on CPU.
+  "quantize_device": "auto",
+  # When enabled, each newly materialized SVDQ linear layer is moved back to CPU
+  # immediately after per-layer quantization. This reduces CUDA peak memory and
+  # lets callers do a single final move once all target layers are quantized.
+  "offload_quantized_layers_to_cpu": False,
+  # When enabled, SVDQ PTQ calibration and DQ few-shot collection may attach
+  # cache-dit layerwise CPU offload hooks for candidate linear layers.
+  "layerwise_offload": False,
+  # When enabled and layerwise collection offload is active, cache-dit uses a
+  # dedicated CUDA copy stream to overlap CPU<->CUDA transfers with compute.
+  "async_transfer": False,
+  # Number of future targets to prefetch when async_transfer is enabled for
+  # layerwise collection offload.
+  "transfer_buckets": 1,
+  # When enabled for few-shot DQ, helper flows may skip the eager final
+  # `pipe.to(cuda)` and move the pipeline only after runtime quantization has
+  # completed.
+  "defer_move_to_execution_device": False,
   # Only valid when streaming is set to True. It specifies the number of samples after
   # which the activation buffers will be flushed and the quantization parameters will
   # be updated. This can help to reduce the memory usage during quantization, especially
@@ -114,6 +138,16 @@ def _resolve_svdq_runtime_kernel(key: str, value: Any) -> str:
   return normalized
 
 
+def _resolve_svdq_quantize_device(key: str, value: Any) -> str:
+  if not isinstance(value, str):
+    raise TypeError(f"svdq_kwargs[{key!r}] must be a str, got {type(value)}.")
+  normalized = value.lower()
+  if normalized not in _SVDQ_QUANTIZE_DEVICES:
+    raise ValueError(
+      f"svdq_kwargs[{key!r}] must be one of {_SVDQ_QUANTIZE_DEVICES}, got {value!r}.")
+  return normalized
+
+
 def _resolve_svdq_smooth_strategy(key: str, value: Any) -> str:
   if not isinstance(value, str):
     raise TypeError(f"svdq_kwargs[{key!r}] must be a str, got {type(value)}.")
@@ -129,6 +163,14 @@ def _resolve_svdq_positive_int_or_none(key: str, value: Any) -> int | None:
     return None
   if isinstance(value, bool) or not isinstance(value, int):
     raise TypeError(f"svdq_kwargs[{key!r}] must be an int or None, got {type(value)}.")
+  if value <= 0:
+    raise ValueError(f"svdq_kwargs[{key!r}] must be a positive integer, got {value}.")
+  return value
+
+
+def _resolve_svdq_positive_int(key: str, value: Any) -> int:
+  if isinstance(value, bool) or not isinstance(value, int):
+    raise TypeError(f"svdq_kwargs[{key!r}] must be an int, got {type(value)}.")
   if value <= 0:
     raise ValueError(f"svdq_kwargs[{key!r}] must be a positive integer, got {value}.")
   return value
@@ -205,6 +247,12 @@ def _resolve_svdq_kwargs(svdq_kwargs: Optional[Dict[str, Any]]) -> Dict[str, Any
     "streaming": _resolve_svdq_bool_kwarg,
     "calibrate_precision": _resolve_svdq_calibrate_precision,
     "runtime_kernel": _resolve_svdq_runtime_kernel,
+    "quantize_device": _resolve_svdq_quantize_device,
+    "offload_quantized_layers_to_cpu": _resolve_svdq_bool_kwarg,
+    "layerwise_offload": _resolve_svdq_bool_kwarg,
+    "async_transfer": _resolve_svdq_bool_kwarg,
+    "transfer_buckets": _resolve_svdq_positive_int,
+    "defer_move_to_execution_device": _resolve_svdq_bool_kwarg,
     "activation_buffer_flush_sample_count": _resolve_svdq_positive_int_or_none,
     "activation_buffer_flush_cpu_bytes": _resolve_svdq_positive_int_or_none,
     "smooth_strategy": _resolve_svdq_smooth_strategy,
