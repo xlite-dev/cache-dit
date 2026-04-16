@@ -9,16 +9,13 @@ try:
   from nunchaku.models.transformers.transformer_flux_v2 import (
     NunchakuFluxAttention,
     NunchakuFluxFA2Processor,
-    NunchakuFluxTransformer2DModelV2,
   )
   from nunchaku.ops.fused import fused_qkv_norm_rottary
   from nunchaku.models.transformers.transformer_qwenimage import (
     NunchakuQwenAttention,
     NunchakuQwenImageNaiveFA2Processor,
-    NunchakuQwenImageTransformer2DModel,
   )
   from nunchaku.models.transformers.transformer_zimage import (
-    NunchakuZImageTransformer2DModel,
     NunchakuZSingleStreamAttnProcessor,
     NunchakuZImageAttention,
   )
@@ -54,16 +51,6 @@ class NunchakuFluxContextParallelismPlanner(ContextParallelismPlanner):
     **kwargs,
   ) -> _ContextParallelModelPlan:
 
-    self._cp_planner_preferred_native_diffusers = False
-
-    if transformer is not None and self._cp_planner_preferred_native_diffusers:
-
-      assert isinstance(transformer, NunchakuFluxTransformer2DModelV2
-                        ), "Transformer must be an instance of NunchakuFluxTransformer2DModelV2"
-      if hasattr(transformer, "_cp_plan"):
-        if transformer._cp_plan is not None:
-          return transformer._cp_plan
-
     NunchakuFluxFA2Processor.__call__ = __patch_NunchakuFluxFA2Processor__call__
     # Also need to patch the parallel config and attention backend
     if not hasattr(NunchakuFluxFA2Processor, "_cp_config"):
@@ -75,28 +62,7 @@ class NunchakuFluxContextParallelismPlanner(ContextParallelismPlanner):
     if not hasattr(NunchakuFluxAttention, "_attention_backend"):
       NunchakuFluxAttention._attention_backend = None
 
-    # Otherwise, use the custom CP plan defined here, this maybe
-    # a little different from the native diffusers implementation
-    # for some models.
     _cp_plan = {
-      # Here is a Transformer level CP plan for Flux, which will
-      # only apply the only 1 split hook (pre_forward) on the forward
-      # of Transformer, and gather the output after Transformer forward.
-      # Pattern of transformer forward, split_output=False:
-      #     un-split input -> splited input (inside transformer)
-      # Pattern of the transformer_blocks, single_transformer_blocks:
-      #     splited input (previous splited output) -> to_qkv/...
-      #     -> all2all
-      #     -> attn (local head, full seqlen)
-      #     -> all2all
-      #     -> splited output
-      # The `hidden_states` and `encoder_hidden_states` will still keep
-      # itself splited after block forward (namely, automatic split by
-      # the all2all comm op after attn) for the all blocks.
-      # img_ids and txt_ids will only be splited once at the very beginning,
-      # and keep splited through the whole transformer forward. The all2all
-      # comm op only happens on the `out` tensor after local attn not on
-      # img_ids and txt_ids.
       "": {
         "hidden_states":
         _ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
@@ -107,10 +73,6 @@ class NunchakuFluxContextParallelismPlanner(ContextParallelismPlanner):
         "txt_ids":
         _ContextParallelInput(split_dim=0, expected_dims=2, split_output=False),
       },
-      # Then, the final proj_out will gather the splited output.
-      #     splited input (previous splited output)
-      #     -> all gather
-      #     -> un-split output
       "proj_out": _ContextParallelOutput(gather_dim=1, expected_dims=3),
     }
     return _cp_plan
@@ -218,16 +180,6 @@ class NunchakuQwenImageContextParallelismPlanner(ContextParallelismPlanner):
     **kwargs,
   ) -> _ContextParallelModelPlan:
 
-    self._cp_planner_preferred_native_diffusers = False
-
-    if transformer is not None and self._cp_planner_preferred_native_diffusers:
-
-      assert isinstance(transformer, NunchakuQwenImageTransformer2DModel
-                        ), "Transformer must be an instance of NunchakuQwenImageTransformer2DModel"
-      if hasattr(transformer, "_cp_plan"):
-        if transformer._cp_plan is not None:
-          return transformer._cp_plan
-
     NunchakuQwenImageNaiveFA2Processor.__call__ = (
       __patch_NunchakuQwenImageNaiveFA2Processor__call__)
     # Also need to patch the parallel config and attention backend
@@ -240,51 +192,17 @@ class NunchakuQwenImageContextParallelismPlanner(ContextParallelismPlanner):
     if not hasattr(NunchakuQwenAttention, "_attention_backend"):
       NunchakuQwenAttention._attention_backend = None
 
-    # Otherwise, use the custom CP plan defined here, this maybe
-    # a little different from the native diffusers implementation
-    # for some models.
     _cp_plan = {
-      # Here is a Transformer level CP plan for Flux, which will
-      # only apply the only 1 split hook (pre_forward) on the forward
-      # of Transformer, and gather the output after Transformer forward.
-      # Pattern of transformer forward, split_output=False:
-      #     un-split input -> splited input (inside transformer)
-      # Pattern of the transformer_blocks, single_transformer_blocks:
-      #     splited input (previous splited output) -> to_qkv/...
-      #     -> all2all
-      #     -> attn (local head, full seqlen)
-      #     -> all2all
-      #     -> splited output
-      # The `hidden_states` and `encoder_hidden_states` will still keep
-      # itself splited after block forward (namely, automatic split by
-      # the all2all comm op after attn) for the all blocks.
       "": {
         "hidden_states":
         _ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
-        # NOTE: Due to the joint attention implementation of
-        # QwenImageTransformerBlock, we must split the
-        # encoder_hidden_states as well.
         "encoder_hidden_states":
         _ContextParallelInput(split_dim=1, expected_dims=3, split_output=False),
-        # NOTE: But encoder_hidden_states_mask seems never used in
-        # QwenImageTransformerBlock, so we do not split it here.
-        # "encoder_hidden_states_mask": _ContextParallelInput(
-        #     split_dim=1, expected_dims=2, split_output=False
-        # ),
       },
-      # Pattern of pos_embed, split_output=True (split output rather than input):
-      #    un-split input
-      #    -> keep input un-split
-      #    -> rope
-      #    -> splited output
       "pos_embed": {
         0: _ContextParallelInput(split_dim=0, expected_dims=2, split_output=True),
         1: _ContextParallelInput(split_dim=0, expected_dims=2, split_output=True),
       },
-      # Then, the final proj_out will gather the splited output.
-      #     splited input (previous splited output)
-      #     -> all gather
-      #     -> un-split output
       "proj_out": _ContextParallelOutput(gather_dim=1, expected_dims=3),
     }
     return _cp_plan
@@ -385,16 +303,6 @@ class NunchakuZImageContextParallelismPlanner(ContextParallelismPlanner):
     transformer: Optional[torch.nn.Module | ModelMixin] = None,
     **kwargs,
   ) -> _ContextParallelModelPlan:
-
-    # NOTE: Diffusers native CP plan still not supported for ZImageTransformer2DModel
-    self._cp_planner_preferred_native_diffusers = False
-
-    if transformer is not None and self._cp_planner_preferred_native_diffusers:
-      assert isinstance(transformer, NunchakuZImageTransformer2DModel
-                        ), "Transformer must be an instance of NunchakuZImageTransformer2DModel"
-      if hasattr(transformer, "_cp_plan"):
-        if transformer._cp_plan is not None:
-          return transformer._cp_plan
 
     if not hasattr(NunchakuZSingleStreamAttnProcessor, "_cp_config"):
       NunchakuZSingleStreamAttnProcessor._cp_config = None
