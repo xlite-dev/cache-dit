@@ -19,6 +19,7 @@ from ..caching import (
   load_parallelism_config,
 )
 from ..offload import _find_offload_related_hf_hook
+from ..offload import _parse_byte_size_arg
 from ..offload import layerwise_cpu_offload
 from ..offload import remove_layerwise_offload
 from ..quantization import quantize, QuantizeConfig
@@ -778,6 +779,21 @@ def get_args(parse: bool = True, ) -> argparse.ArgumentParser | argparse.Namespa
           "collection when --svdq-layerwise-offload is active."),
   )
   parser.add_argument(
+    "--layerwise-text-async-transfer",
+    dest="layerwise_text_async_transfer",
+    action="store_true",
+    default=None,
+    help=("Override text encoder layerwise async_transfer. When omitted, text encoder layerwise "
+          "offload uses --layerwise-async-transfer."),
+  )
+  parser.add_argument(
+    "--no-layerwise-text-async-transfer",
+    dest="layerwise_text_async_transfer",
+    action="store_false",
+    help=("Disable text encoder layerwise async_transfer even if --layerwise-async-transfer is "
+          "enabled."),
+  )
+  parser.add_argument(
     "--layerwise-transfer-buckets",
     "--svdq-layerwise-transfer-buckets",
     "--svdq-transfer-buckets",
@@ -787,6 +803,13 @@ def get_args(parse: bool = True, ) -> argparse.ArgumentParser | argparse.Namespa
           "Default is 1."),
   )
   parser.add_argument(
+    "--layerwise-text-transfer-buckets",
+    type=int,
+    default=None,
+    help=("Override text encoder layerwise transfer_buckets. When omitted, text encoder "
+          "layerwise offload uses --layerwise-transfer-buckets."),
+  )
+  parser.add_argument(
     "--layerwise-prefetch-limit",
     "--svdq-layerwise-prefetch-limit",
     action="store_true",
@@ -794,6 +817,21 @@ def get_args(parse: bool = True, ) -> argparse.ArgumentParser | argparse.Namespa
     help=("Enable the conservative future-prefetch target-count limit for layerwise async "
           "transfer. When set, runtime caps pending/ready future targets to "
           "min(4 * --layerwise-transfer-buckets, 8). By default this limit is disabled."),
+  )
+  parser.add_argument(
+    "--layerwise-text-prefetch-limit",
+    dest="layerwise_text_prefetch_limit",
+    action="store_true",
+    default=None,
+    help=("Override text encoder layerwise prefetch_limit. When omitted, text encoder layerwise "
+          "offload uses --layerwise-prefetch-limit."),
+  )
+  parser.add_argument(
+    "--no-layerwise-text-prefetch-limit",
+    dest="layerwise_text_prefetch_limit",
+    action="store_false",
+    help=("Disable text encoder layerwise prefetch_limit even if --layerwise-prefetch-limit is "
+          "enabled."),
   )
   parser.add_argument(
     "--layerwise-max-copy-streams",
@@ -806,14 +844,30 @@ def get_args(parse: bool = True, ) -> argparse.ArgumentParser | argparse.Namespa
           "it from --layerwise-transfer-buckets and applies its internal safety cap."),
   )
   parser.add_argument(
+    "--layerwise-text-max-copy-streams",
+    type=int,
+    default=None,
+    help=("Override text encoder layerwise max_copy_streams. When omitted, text encoder "
+          "layerwise offload uses --layerwise-max-copy-streams."),
+  )
+  parser.add_argument(
     "--layerwise-max-inflight-prefetch-bytes",
     "--svdq-layerwise-max-inflight-prefetch-bytes",
-    type=int,
+    type=_parse_byte_size_arg,
     default=None,
     help=("Maximum total CUDA residency budget, in bytes, for in-flight layerwise future-target "
           "prefetch. This shared setting applies to both generic module layerwise offload and "
-          "SVDQ layerwise collection when --svdq-layerwise-offload is active. When omitted, "
-          "runtime leaves the byte-budget limit disabled."),
+          "SVDQ layerwise collection when --svdq-layerwise-offload is active. Accepts raw bytes "
+          "or suffixes like 512MiB and 4GiB. When omitted, runtime leaves the byte-budget "
+          "limit disabled."),
+  )
+  parser.add_argument(
+    "--layerwise-text-max-inflight-prefetch-bytes",
+    type=_parse_byte_size_arg,
+    default=None,
+    help=("Override text encoder layerwise max_inflight_prefetch_bytes. Accepts raw bytes or "
+          "suffixes like 512MiB and 4GiB. When omitted, text encoder layerwise offload uses "
+          "--layerwise-max-inflight-prefetch-bytes."),
   )
   parser.add_argument(
     "--layerwise-persistent-buckets",
@@ -824,6 +878,13 @@ def get_args(parse: bool = True, ) -> argparse.ArgumentParser | argparse.Namespa
     help=("How many selected layerwise offload targets should stay resident on CUDA for the full "
           "handle lifetime. This shared setting applies to both generic module layerwise offload "
           "and SVDQ layerwise collection when --svdq-layerwise-offload is active. Default is 0."),
+  )
+  parser.add_argument(
+    "--layerwise-text-persistent-buckets",
+    type=int,
+    default=None,
+    help=("Override text encoder layerwise persistent_buckets. When omitted, text encoder "
+          "layerwise offload uses --layerwise-persistent-buckets."),
   )
   parser.add_argument(
     "--layerwise-persistent-bins",
@@ -837,6 +898,13 @@ def get_args(parse: bool = True, ) -> argparse.ArgumentParser | argparse.Namespa
           "--layerwise-persistent-bins 4, runtime keeps [0:4), [8:12), [16:20), and [24:28) "
           "resident. This shared setting applies to both generic module layerwise offload and "
           "SVDQ layerwise collection when --svdq-layerwise-offload is active. Default is 1."),
+  )
+  parser.add_argument(
+    "--layerwise-text-persistent-bins",
+    type=int,
+    default=None,
+    help=("Override text encoder layerwise persistent_bins. When omitted, text encoder "
+          "layerwise offload uses --layerwise-persistent-bins."),
   )
   parser.add_argument(
     "--device-map-balance",
@@ -1943,6 +2011,91 @@ def _resolve_generic_offload_targets(
   return targets
 
 
+def _is_text_encoder_offload_target(name: str) -> bool:
+  return (name == "text_encoder" or name.startswith("text_encoder_")
+          or name == "vision_language_encoder")
+
+
+def _resolve_layerwise_target_arg(
+  args: argparse.Namespace,
+  *,
+  target_name: str,
+  base_attr: str,
+  text_attr: str,
+):
+  base_value = getattr(args, base_attr)
+  if not _is_text_encoder_offload_target(target_name):
+    return base_value
+  text_value = getattr(args, text_attr)
+  return base_value if text_value is None else text_value
+
+
+def _resolve_layerwise_target_kwargs(
+  args: argparse.Namespace,
+  *,
+  target_name: str,
+  onload_device: torch.device,
+) -> dict[str, Any]:
+  return {
+    "onload_device":
+    onload_device,
+    "async_transfer":
+    bool(
+      _resolve_layerwise_target_arg(
+        args,
+        target_name=target_name,
+        base_attr="layerwise_async_transfer",
+        text_attr="layerwise_text_async_transfer",
+      )),
+    "transfer_buckets":
+    int(
+      _resolve_layerwise_target_arg(
+        args,
+        target_name=target_name,
+        base_attr="layerwise_transfer_buckets",
+        text_attr="layerwise_text_transfer_buckets",
+      )),
+    "prefetch_limit":
+    bool(
+      _resolve_layerwise_target_arg(
+        args,
+        target_name=target_name,
+        base_attr="layerwise_prefetch_limit",
+        text_attr="layerwise_text_prefetch_limit",
+      )),
+    "max_copy_streams":
+    _resolve_layerwise_target_arg(
+      args,
+      target_name=target_name,
+      base_attr="layerwise_max_copy_streams",
+      text_attr="layerwise_text_max_copy_streams",
+    ),
+    "max_inflight_prefetch_bytes":
+    _resolve_layerwise_target_arg(
+      args,
+      target_name=target_name,
+      base_attr="layerwise_max_inflight_prefetch_bytes",
+      text_attr="layerwise_text_max_inflight_prefetch_bytes",
+    ),
+    "persistent_buckets":
+    int(
+      _resolve_layerwise_target_arg(
+        args,
+        target_name=target_name,
+        base_attr="layerwise_persistent_buckets",
+        text_attr="layerwise_text_persistent_buckets",
+      )),
+    "persistent_bins":
+    int(
+      _resolve_layerwise_target_arg(
+        args,
+        target_name=target_name,
+        base_attr="layerwise_persistent_bins",
+        text_attr="layerwise_text_persistent_bins",
+      )),
+  }
+
+
 def maybe_generic_module_offload(
   args,
   pipe_or_adapter: DiffusionPipeline | BlockAdapter | torch.nn.Module | Any,
@@ -1982,14 +2135,7 @@ def maybe_generic_module_offload(
     handles.append(
       layerwise_cpu_offload(
         module,
-        onload_device=device,
-        async_transfer=bool(getattr(args, "layerwise_async_transfer", False)),
-        transfer_buckets=int(getattr(args, "layerwise_transfer_buckets", 1)),
-        prefetch_limit=bool(getattr(args, "layerwise_prefetch_limit", False)),
-        max_copy_streams=getattr(args, "layerwise_max_copy_streams", None),
-        max_inflight_prefetch_bytes=getattr(args, "layerwise_max_inflight_prefetch_bytes", None),
-        persistent_buckets=int(getattr(args, "layerwise_persistent_buckets", 0)),
-        persistent_bins=int(getattr(args, "layerwise_persistent_bins", 1)),
+        **_resolve_layerwise_target_kwargs(args, target_name=name, onload_device=device),
       ))
   return bool(handles) or skipped_due_to_existing_offload
 
